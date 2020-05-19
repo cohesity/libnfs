@@ -661,6 +661,21 @@ nfs4_op_access(struct nfs_context *nfs, nfs_argop4 *op, uint32_t access_mask)
         return 1;
 }
 
+static int nfs4_op_exchangeid(struct nfs_context *nfs, nfs_argop4 *op,
+                              verifier4 verifier, const char *client_name) {
+  EXCHANGE_ID4args *exidargs;
+  op[0].argop = OP_EXCHANGE_ID;
+  exidargs = &op[0].nfs_argop4_u.opexchange_id;
+
+  memcpy(exidargs->eia_clientowner.co_verifier, verifier,
+         sizeof(verifier4));
+
+  exidargs->eia_clientowner.co_ownerid.co_ownerid_val = strdup("test client");
+  exidargs->eia_clientowner.co_ownerid.co_ownerid_len =
+      strlen(exidargs->eia_clientowner.co_ownerid.co_ownerid_val);
+  return 1;
+}
+
 static int
 nfs4_op_setclientid(struct nfs_context *nfs, nfs_argop4 *op, verifier4 verifier,
                     const char *client_name)
@@ -682,8 +697,8 @@ nfs4_op_setclientid(struct nfs_context *nfs, nfs_argop4 *op, verifier4 verifier,
          *   the originating address and program anyway. )
          */
         scidargs->callback.cb_program = 0; /* NFS4_CALLBACK */
-        scidargs->callback.cb_location.r_netid = "tcp";
-        scidargs->callback.cb_location.r_addr = "0.0.0.0.0.0";
+        scidargs->callback.cb_location.na_r_netid = "tcp";
+        scidargs->callback.cb_location.na_r_addr = "0.0.0.0.0.0";
         scidargs->callback_ident = 0x00000001;
 
         return 1;
@@ -1012,6 +1027,34 @@ nfs4_op_lookup(struct nfs_context *nfs, nfs_argop4 *op, const char *path)
         largs->objname.utf8string_val = discard_const(path);
 
         return 1;
+}
+
+static int nfs4_op_create_session(struct nfs_context *nfs,
+                                  struct nfs_argop4 *op, uint64_t clientid) {
+
+  CREATE_SESSION4args *create_session_args;
+
+  op[0].argop = OP_CREATE_SESSION;
+  create_session_args = &op[0].nfs_argop4_u.opcreate_session;
+  *create_session_args = (const CREATE_SESSION4args){ 0 };
+  create_session_args->csa_clientid = clientid;
+  create_session_args->csa_sequence = 1;
+  create_session_args->csa_fore_chan_attrs.ca_headerpadsize = 0;
+  create_session_args->csa_fore_chan_attrs.ca_maxrequestsize = 1049620;
+  create_session_args->csa_fore_chan_attrs.ca_maxresponsesize = 1049480;
+  create_session_args->csa_fore_chan_attrs.ca_maxresponsesize_cached = 4616;
+  create_session_args->csa_fore_chan_attrs.ca_maxoperations = 8;
+  create_session_args->csa_fore_chan_attrs.ca_maxrequests = 64;
+
+  create_session_args->csa_back_chan_attrs.ca_headerpadsize = 0;
+  create_session_args->csa_back_chan_attrs.ca_maxrequestsize = 4096;
+  create_session_args->csa_back_chan_attrs.ca_maxresponsesize = 4096;
+  create_session_args->csa_back_chan_attrs.ca_maxresponsesize_cached = 0;
+  create_session_args->csa_back_chan_attrs.ca_maxoperations = 2;
+  create_session_args->csa_back_chan_attrs.ca_maxrequests = 1;
+
+
+  return 1;
 }
 
 static int
@@ -1357,17 +1400,18 @@ nfs4_lookup_path_1_cb(struct rpc_context *rpc, int status, void *command_data,
         i += nfs4_op_readlink(nfs, &op[i]);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_lookup_path_2_cb, &args,
-                                    data) != 0) {
-                nfs_set_error(nfs, "Failed to queue READLINK command. %s",
-                              nfs_get_error(nfs));
-                data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
-                free_nfs4_cb_data(data);
-                free(path);
-                return;
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
+          nfs_set_error(nfs, "Failed to queue READLINK command. %s",
+                        nfs_get_error(nfs));
+          data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
+          free_nfs4_cb_data(data);
+          free(path);
+          return;
         }
         free(path);
 }
@@ -1394,20 +1438,23 @@ nfs4_lookup_path_async(struct nfs_context *nfs,
                 return -1;
         }
 
+        fprintf(stderr, "path %s\n", path);
         if ((i = nfs4_allocate_op(nfs, &op, path, data->filler.max_op)) < 0) {
                 free(path);
                 return -1;
         }
 
+
         num_op = data->filler.func(data, &op[i]);
         data->continue_cb = cb;
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i + num_op;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_lookup_path_1_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 nfs_set_error(nfs, "Failed to queue LOOKUP command. %s",
                               nfs_get_error(nfs));
                 free(path);
@@ -1487,12 +1534,14 @@ nfs4_mount_3_cb(struct rpc_context *rpc, int status, void *command_data,
         struct nfs4_cb_data *data = private_data;
         struct nfs_context *nfs = data->nfs;
         COMPOUND4res *res = command_data;
-
         assert(rpc->magic == RPC_CONTEXT_MAGIC);
 
-        if (check_nfs4_error(nfs, status, data, res, "SETCLIENTID_CONFIRM")) {
-                return;
+        if (check_nfs4_error(nfs, status, data, res,
+                             nfs->minorversion == 1 ? "CREATE_SESSION"
+                                                    : "SETCLIENTID_CONFIRM")) {
+          return;
         }
+
 
         data->filler.func = nfs4_populate_getfh;
         data->filler.max_op = 1;
@@ -1514,6 +1563,73 @@ nfs4_mount_3_cb(struct rpc_context *rpc, int status, void *command_data,
         }
 }
 
+
+static void
+nfs4_mount_2_5_cb(struct rpc_context *rpc, int status, void *command_data,
+                void *private_data)
+{
+        struct nfs4_cb_data *data = private_data;
+        struct nfs_context *nfs = data->nfs;
+        COMPOUND4res *res = command_data;
+        CREATE_SESSION4resok *createSessionIdResok;
+        COMPOUND4args args;
+        nfs_argop4 op[1];
+
+        assert(rpc->magic == RPC_CONTEXT_MAGIC);
+
+        if (check_nfs4_error(nfs, status, data, res,
+                             nfs->minorversion == 1 ? "CREATE_SESSION"
+                                                    : "SETCLIENTID_CONFIRM")) {
+          return;
+        }
+
+        if (nfs->minorversion == 1) {
+          createSessionIdResok = &res->resarray.resarray_val[0]
+                                      .nfs_resop4_u.opcreate_session
+                                      .CREATE_SESSION4res_u.csr_resok4;
+          memcpy(nfs->sessionid, createSessionIdResok->csr_sessionid,
+                 sizeof(sessionid4));
+          nfs->seqid = createSessionIdResok->csr_sequence;
+
+          memset(&op[0], 0, sizeof(nfs_argop4));
+          op[0].argop = OP_RECLAIM_COMPLETE;
+          memset(&args, 0, sizeof(args));
+          args.minorversion = nfs->minorversion;
+          args.argarray.argarray_len = 1;
+          args.argarray.argarray_val = op;
+
+          if (rpc_nfs4_compound_async(rpc, nfs4_mount_3_cb, &args, private_data,
+                                      nfs->sessionid, &nfs->seqid) != 0) {
+            nfs_set_error(nfs, "Failed to queue RECLAIM_COMPLETE. %s",
+                          nfs_get_error(nfs));
+            data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
+            free_nfs4_cb_data(data);
+            return;
+          }
+
+        } else {
+          data->filler.func = nfs4_populate_getfh;
+          data->filler.max_op = 1;
+          data->filler.data = malloc(2 * sizeof(uint32_t));
+          if (data->filler.data == NULL) {
+            nfs_set_error(nfs,
+                          "Out of memory. Failed to allocate "
+                          "data structure.");
+            data->cb(-ENOMEM, nfs, res, data->private_data);
+            free_nfs4_cb_data(data);
+            return;
+          }
+          memset(data->filler.data, 0, 2 * sizeof(uint32_t));
+
+          if (nfs4_lookup_path_async(nfs, data, nfs4_mount_4_cb) < 0) {
+            data->cb(-ENOMEM, nfs, res, data->private_data);
+            free_nfs4_cb_data(data);
+            return;
+          }
+        }
+}
+
+
 static void
 nfs4_mount_2_cb(struct rpc_context *rpc, int status, void *command_data,
                 void *private_data)
@@ -1524,37 +1640,50 @@ nfs4_mount_2_cb(struct rpc_context *rpc, int status, void *command_data,
         COMPOUND4args args;
         nfs_argop4 op[1];
         SETCLIENTID4resok *scidresok;
+        EXCHANGE_ID4resok *excidresok;
         int i;
 
         assert(rpc->magic == RPC_CONTEXT_MAGIC);
 
-        if (check_nfs4_error(nfs, status, data, res, "SETCLIENTID")) {
+        if (check_nfs4_error(nfs, status, data, res,
+            nfs->minorversion == 1 ? "EXCHANGEID" : "SETCLIENTID")) {
                 return;
         }
 
-        scidresok = &res->resarray.resarray_val[0].nfs_resop4_u.opsetclientid.SETCLIENTID4res_u.resok4;
-        nfs->clientid = scidresok->clientid;
-        memcpy(nfs->setclientid_confirm,
-               scidresok->setclientid_confirm,
-               NFS4_VERIFIER_SIZE);
+        if (nfs->minorversion == 0) {
+          scidresok = &res->resarray.resarray_val[0]
+                           .nfs_resop4_u.opsetclientid.SETCLIENTID4res_u.resok4;
+          nfs->clientid = scidresok->clientid;
+          memcpy(nfs->setclientid_confirm, scidresok->setclientid_confirm,
+                 NFS4_VERIFIER_SIZE);
 
-        memset(op, 0, sizeof(op));
+          memset(op, 0, sizeof(op));
 
-        i = nfs4_op_setclientid_confirm(nfs, &op[0], nfs->clientid,
-                                        nfs->setclientid_confirm);
-               
+          i = nfs4_op_setclientid_confirm(nfs, &op[0], nfs->clientid,
+                                          nfs->setclientid_confirm);
+        } else {
+          excidresok =
+              &res->resarray.resarray_val[0]
+                   .nfs_resop4_u.opexchange_id.EXCHANGE_ID4res_u.eir_resok4;
+          nfs->clientid = excidresok->eir_clientid;
+
+          i = nfs4_op_create_session(nfs, &op[0], nfs->clientid);
+
+        }
+
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
-        if (rpc_nfs4_compound_async(rpc, nfs4_mount_3_cb, &args,
-                                    private_data) != 0) {
-                nfs_set_error(nfs, "Failed to queue SETCLIENTID_CONFIRM. %s",
-                              nfs_get_error(nfs));
-                data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
-                free_nfs4_cb_data(data);
-                return;
-        }
+        if (rpc_nfs4_compound_async(rpc, nfs4_mount_2_5_cb, &args, private_data,
+                                    nfs->sessionid, &nfs->seqid) != 0) {
+            nfs_set_error(nfs, "Failed to queue SETCLIENTID_CONFIRM. %s",
+                          nfs_get_error(nfs));
+            data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
+            free_nfs4_cb_data(data);
+            return;
+          }
 }
 
 static void
@@ -1575,19 +1704,25 @@ nfs4_mount_1_cb(struct rpc_context *rpc, int status, void *command_data,
 
         memset(op, 0, sizeof(op));
 
-        i = nfs4_op_setclientid(nfs, &op[0], nfs->verifier, nfs->client_name);
-        
+        if (nfs->minorversion == 1) {
+          i = nfs4_op_exchangeid(nfs, &op[0], nfs->verifier, nfs->client_name);
+        } else {
+          i = nfs4_op_setclientid(nfs, &op[0], nfs->verifier, nfs->client_name);
+        }
+
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
-        if (rpc_nfs4_compound_async(rpc, nfs4_mount_2_cb, &args, data) != 0) {
+        if (rpc_nfs4_compound_async(rpc, nfs4_mount_2_cb, &args, data,
+                                    nfs->sessionid, &nfs->seqid)   != 0) {
                 nfs_set_error(nfs, "Failed to queue SETCLIENTID. %s",
                               nfs_get_error(nfs));
                 data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
                 free_nfs4_cb_data(data);
                 return;
-        }
+          }
 }
 
 int
@@ -1963,15 +2098,16 @@ nfs4_open_truncate_cb(struct rpc_context *rpc, int status, void *command_data,
         i += nfs4_op_truncate(nfs, &op[i], fh, data->filler.blob3.val);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
-        if (rpc_nfs4_compound_async(nfs->rpc, nfs4_open_setattr_cb, &args,
-                                    data) != 0) {
-                data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
-                free_nfs4_cb_data(data);
-                return;
-        }
+        if (rpc_nfs4_compound_async(nfs->rpc, nfs4_open_setattr_cb, &args, data,
+                                    nfs->sessionid, &nfs->seqid) != 0) {
+            data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
+            free_nfs4_cb_data(data);
+            return;
+          }
 }
 
 static void
@@ -1994,15 +2130,16 @@ nfs4_open_chmod_cb(struct rpc_context *rpc, int status, void *command_data,
         i += nfs4_op_chmod(nfs, &op[i], fh, data->filler.blob3.val);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
-        if (rpc_nfs4_compound_async(nfs->rpc, nfs4_open_setattr_cb, &args,
-                                    data) != 0) {
-                data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
-                free_nfs4_cb_data(data);
-                return;
-        }
+        if (rpc_nfs4_compound_async(nfs->rpc, nfs4_open_setattr_cb, &args, data,
+                                    nfs->sessionid, &nfs->seqid) != 0) {
+            data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
+            free_nfs4_cb_data(data);
+            return;
+          }
 }
 
 static void
@@ -2138,16 +2275,18 @@ nfs4_open_cb(struct rpc_context *rpc, int status, void *command_data,
                 i += nfs4_op_open_confirm(nfs, &op[i], nfs->seqid, fh);
 
                 memset(&args, 0, sizeof(args));
+                args.minorversion = nfs->minorversion;
                 args.argarray.argarray_len = i;
                 args.argarray.argarray_val = op;
 
                 if (rpc_nfs4_compound_async(rpc, nfs4_open_confirm_cb, &args,
-                                            private_data) != 0) {
-                        data->cb(-ENOMEM, nfs, nfs_get_error(nfs),
-                                 data->private_data);
-                        free_nfs4_cb_data(data);
-                        return;
-                }
+                                            private_data, nfs->sessionid,
+                                            &nfs->seqid) != 0) {
+                    data->cb(-ENOMEM, nfs, nfs_get_error(nfs),
+                             data->private_data);
+                    free_nfs4_cb_data(data);
+                    return;
+                  }
                 return;
         }
 
@@ -2445,10 +2584,14 @@ nfs4_open_async(struct nfs_context *nfs, const char *path, int flags,
         struct nfs4_cb_data *data;
         uint32_t m;
 
+        fprintf(stderr, "open path %s\n", path);
+
         data = init_cb_data_split_path(nfs, path);
         if (data == NULL) {
                 return -1;
         }
+
+        fprintf(stderr, "open path %s after split\n", data->path);
 
         data->cb           = cb;
         data->private_data = private_data;
@@ -2518,11 +2661,12 @@ nfs4_fstat64_async(struct nfs_context *nfs, struct nfsfh *nfsfh, nfs_cb cb,
         i += nfs4_op_getattr(nfs, &op[i], standard_attributes, 2);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_xstat64_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 free_nfs4_cb_data(data);
                 return -1;
         }
@@ -2582,11 +2726,12 @@ nfs4_close_async(struct nfs_context *nfs, struct nfsfh *nfsfh, nfs_cb cb,
         data->filler.blob0.free = (blob_free)nfs_free_nfsfh;
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_close_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 data->filler.blob0.val = NULL;
                 free_nfs4_cb_data(data);
                 return -1;
@@ -2661,11 +2806,12 @@ nfs4_pread_async_internal(struct nfs_context *nfs, struct nfsfh *nfsfh,
         i += nfs4_op_read(nfs, &op[i], nfsfh, offset, count);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_pread_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 free_nfs4_cb_data(data);
                 return -1;
         }
@@ -2859,15 +3005,18 @@ nfs4_pwrite_async_internal(struct nfs_context *nfs, struct nfsfh *nfsfh,
         i += nfs4_op_write(nfs, &op[i], nfsfh, offset, count, buf);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
-        if (rpc_nfs4_compound_async2(nfs->rpc, nfs4_pwrite_cb, &args,
-                                    data, count) != 0) {
-                nfs_set_error(nfs, "PWRITE "
-                        "failed: %s", rpc_get_error(nfs->rpc));
-                free_nfs4_cb_data(data);
-                return -EIO;
+        if (rpc_nfs4_compound_async2(nfs->rpc, nfs4_pwrite_cb, &args, data,
+                                     count, nfs->sessionid, &nfs->seqid) != 0) {
+          nfs_set_error(nfs,
+                        "PWRITE "
+                        "failed: %s",
+                        rpc_get_error(nfs->rpc));
+          free_nfs4_cb_data(data);
+          return -EIO;
         }
 
         return 0;
@@ -2959,6 +3108,7 @@ nfs4_write_async(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t count,
                 i += nfs4_op_getattr(nfs, &op[i], standard_attributes, 2);
 
                 memset(&args, 0, sizeof(args));
+                args.minorversion = nfs->minorversion;
                 args.argarray.argarray_len = i;
                 args.argarray.argarray_val = op;
 
@@ -2970,11 +3120,14 @@ nfs4_write_async(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t count,
                 data->filler.blob1.free = NULL;
 
                 if (rpc_nfs4_compound_async2(nfs->rpc, nfs4_write_append_cb,
-                                            &args, data, count) != 0) {
-                        nfs_set_error(nfs, "PWRITE "
-                                "failed: %s", rpc_get_error(nfs->rpc));
-                        free_nfs4_cb_data(data);
-                        return -EIO;
+                                             &args, data, count, nfs->sessionid,
+                                             &nfs->seqid) != 0) {
+                  nfs_set_error(nfs,
+                                "PWRITE "
+                                "failed: %s",
+                                rpc_get_error(nfs->rpc));
+                  free_nfs4_cb_data(data);
+                  return -EIO;
                 }
 
                 return 0;
@@ -3431,11 +3584,12 @@ nfs4_opendir_continue(struct nfs_context *nfs, struct nfs4_cb_data *data)
         i += nfs4_op_readdir(nfs, &op[i], cookie);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_opendir_2_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 nfs_set_error(nfs, "Failed to queue READDIR command. %s",
                               nfs_get_error(nfs));
                 data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
@@ -3710,11 +3864,12 @@ nfs4_truncate_open_cb(struct rpc_context *rpc, int status, void *command_data,
         i += nfs4_op_close(nfs, &op[i], fh);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_truncate_close_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 /* Not much we can do but leak one fd on the server :( */
                 data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
                 free_nfs4_cb_data(data);
@@ -3803,11 +3958,12 @@ nfs4_fsync_async(struct nfs_context *nfs, struct nfsfh *fh, nfs_cb cb,
         i += nfs4_op_commit(nfs, &op[i]);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_fsync_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 data->filler.blob0.val = NULL;
                 free_nfs4_cb_data(data);
                 return -1;
@@ -3854,11 +4010,12 @@ nfs4_ftruncate_async(struct nfs_context *nfs, struct nfsfh *fh,
         i += nfs4_op_truncate(nfs, &op[i], fh, data->filler.blob3.val);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_fsync_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 data->filler.blob0.val = NULL;
                 free_nfs4_cb_data(data);
                 return -1;
@@ -3974,11 +4131,12 @@ nfs4_lseek_async(struct nfs_context *nfs, struct nfsfh *fh, int64_t offset,
         i += nfs4_op_getattr(nfs, &op[i], standard_attributes, 2);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_lseek_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 free_nfs4_cb_data(data);
                 return -1;
         }
@@ -4087,11 +4245,12 @@ nfs4_lockf_async(struct nfs_context *nfs, struct nfsfh *fh,
         }
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_lockf_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 free_nfs4_cb_data(data);
                 return -1;
         }
@@ -4192,11 +4351,12 @@ nfs4_fcntl_async_internal(struct nfs_context *nfs, struct nfsfh *fh,
         }
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_fcntl_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 free_nfs4_cb_data(data);
                 return -1;
         }
@@ -4299,14 +4459,15 @@ nfs4_fcntl_async(struct nfs_context *nfs, struct nfsfh *fh,
                                              2);
 
                         memset(&args, 0, sizeof(args));
+                        args.minorversion = nfs->minorversion;
                         args.argarray.argarray_len = i;
                         args.argarray.argarray_val = op;
 
-                        if (rpc_nfs4_compound_async(nfs->rpc,
-                                                    nfs4_fcntl_stat_cb,
-                                                    &args, data) != 0) {
-                                free_nfs4_cb_data(data);
-                                return -1;
+                        if (rpc_nfs4_compound_async(
+                                nfs->rpc, nfs4_fcntl_stat_cb, &args, data,
+                                nfs->sessionid, &nfs->seqid) != 0) {
+                          free_nfs4_cb_data(data);
+                          return -1;
                         }
                         return 0;
                 }
@@ -4566,11 +4727,12 @@ nfs4_statvfs_async_internal(struct nfs_context *nfs, const char *path,
         i += nfs4_op_getattr(nfs, &op[i], statvfs_attributes, 2);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_statvfs_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 free_nfs4_cb_data(data);
                 return -1;
         }
@@ -4694,11 +4856,12 @@ nfs4_fchmod_async(struct nfs_context *nfs, struct nfsfh *fh, int mode,
         i += nfs4_op_chmod(nfs, &op[i], fh, data->filler.blob3.val);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_fsync_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 data->filler.blob0.val = NULL;
                 free_nfs4_cb_data(data);
                 return -1;
@@ -4845,11 +5008,12 @@ nfs4_fchown_async(struct nfs_context *nfs, struct nfsfh *fh, int uid, int gid,
                            data->filler.blob3.len);
 
         memset(&args, 0, sizeof(args));
+        args.minorversion = nfs->minorversion;
         args.argarray.argarray_len = i;
         args.argarray.argarray_val = op;
 
         if (rpc_nfs4_compound_async(nfs->rpc, nfs4_fsync_cb, &args,
-                                    data) != 0) {
+                                    data, nfs->sessionid, &nfs->seqid) != 0) {
                 data->filler.blob0.val = NULL;
                 free_nfs4_cb_data(data);
                 return -1;

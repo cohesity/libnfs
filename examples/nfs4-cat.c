@@ -120,6 +120,7 @@ void usage(void)
 	exit(0);
 }
 
+#if 0
 static void update_events(struct rpc_context *rpc, struct event *read_event,
                           struct event *write_event)
 {
@@ -299,8 +300,8 @@ static void send_setclientid(struct rpc_context *rpc,
                 
         op[0].nfs_argop4_u.opsetclientid.callback.cb_program = NFS4_CALLBACK;
 
-        op[0].nfs_argop4_u.opsetclientid.callback.cb_location.r_netid = netid;
-        op[0].nfs_argop4_u.opsetclientid.callback.cb_location.r_addr = addr;
+        op[0].nfs_argop4_u.opsetclientid.callback.cb_location.na_r_netid = netid;
+        op[0].nfs_argop4_u.opsetclientid.callback.cb_location.na_r_addr = addr;
 
         op[0].nfs_argop4_u.opsetclientid.callback_ident = 0x00000001;
         
@@ -831,9 +832,11 @@ void connect_cb(struct rpc_context *rpc, int status, void *data _U_,
          */
         send_setclientid(rpc, setclientid_cb, client);
 }
+#endif
 
 int main(int argc, char *argv[])
 {
+#if 0
 	struct nfs_context *nfs;
         struct nfs_url *url;
 	struct client client;
@@ -938,6 +941,6 @@ int main(int argc, char *argv[])
 	nfs_destroy_context(nfs);
 
         event_base_free(base);
-
+#endif
 	return 0;
 }

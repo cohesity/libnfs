@@ -292,6 +292,7 @@ struct nfs_context {
        struct nested_mounts *nested_mounts;
 
         int version;
+        int minorversion;
         int nfsport;
         int mountport;
 
@@ -299,6 +300,7 @@ struct nfs_context {
         verifier4 verifier;
         char *client_name;
         uint64_t clientid;
+        sessionid4 sessionid;
         verifier4 setclientid_confirm;
         uint32_t seqid;
         int has_lock_owner;
