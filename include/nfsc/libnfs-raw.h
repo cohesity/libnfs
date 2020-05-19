@@ -2297,7 +2297,6 @@ EXTERN int rpc_nfs4_compound_async2(struct rpc_context *rpc, rpc_cb cb,
                                    struct COMPOUND4args *args,
                                    void *private_data,
                                    size_t alloc_hint,
-                                   void *private_data,
                                    sessionid4 sessionid,
                                    uint32_t* seqid);
 
