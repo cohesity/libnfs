@@ -291,7 +291,13 @@ nfs_set_context_args(struct nfs_context *nfs, const char *arg, const char *val)
 				      atoi(val));
 			return -1;
 		}
-	} else if (!strcmp(arg, "nfsport")) {
+	} else if (!strcmp(arg, "minor_version")) {
+    if (nfs_set_minor_version(nfs, atoi(val)) < 0) {
+      nfs_set_error(nfs, "NFS minor version %d is not supported",
+              atoi(val));
+      return -1;
+    }
+  } else if (!strcmp(arg, "nfsport")) {
 		nfs->nfsport =  atoi(val);
 	} else if (!strcmp(arg, "mountport")) {
 		nfs->mountport =  atoi(val);
@@ -318,6 +324,7 @@ nfs_parse_url(struct nfs_context *nfs, const char *url, int dir, int incomplete)
 
 	memset(urls, 0x00, sizeof(struct nfs_url));
 	urls->server = strdup(url + 6);
+	fprintf(stderr, "url server %s\n", urls->server);
 	if (urls->server == NULL) {
 		nfs_destroy_url(urls);
 		nfs_set_error(nfs, "Out of memory");
@@ -347,6 +354,7 @@ nfs_parse_url(struct nfs_context *nfs, const char *url, int dir, int incomplete)
 	}
 
 	urls->path = strdup(strp);
+	fprintf(stderr, "url path %s\n", urls->path);
 	if (urls->path == NULL) {
 		nfs_destroy_url(urls);
 		nfs_set_error(nfs, "Out of memory");
@@ -1843,6 +1851,21 @@ nfs_set_version(struct nfs_context *nfs, int version) {
 	}
 	return 0;
 }
+
+
+int
+nfs_set_minor_version(struct nfs_context *nfs, int version) {
+  switch (version) {
+  case 1:
+    nfs->minorversion = version;
+    break;
+  default:
+    nfs_set_error(nfs, "NFS minor version %d is not supported", version);
+    return -1;
+  }
+  return 0;
+}
+
 
 void
 nfs_set_error(struct nfs_context *nfs, char *error_string, ...)
