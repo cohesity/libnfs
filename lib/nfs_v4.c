@@ -163,6 +163,14 @@ struct nfs4_cb_data {
 
         /* Data we need for updating offset in read/write */
         struct rw_data rw_data;
+
+        char **lookup_path_components;
+
+        int lookup_curr_component_idx;
+
+        int lookup_total_components;
+
+        struct nfs_fh lookup_last_fh;
 };
 
 static uint32_t standard_attributes[2] = {
@@ -1118,7 +1126,7 @@ nfs4_op_getattr(struct nfs_context *nfs, nfs_argop4 *op,
  */
 static int
 nfs4_allocate_op(struct nfs_context *nfs, nfs_argop4 **op,
-                 char *path, int num_extra)
+                 char *path, int num_extra, struct nfs_fh *nfs_fh)
 {
         char *ptr;
         int i, count;
@@ -1134,7 +1142,13 @@ nfs4_allocate_op(struct nfs_context *nfs, nfs_argop4 **op,
         }
 
         i = 0;
-        if (nfs->rootfh.len) {
+        if (nfs_fh != NULL && nfs_fh->len) {
+          struct nfsfh fh;
+
+          fh.fh.len = nfs_fh->len;
+          fh.fh.val = nfs_fh->val;
+          i += nfs4_op_putfh(nfs, &(*op)[i], &fh);
+        } else if (nfs->rootfh.len) {
                 struct nfsfh fh;
 
                 fh.fh.len = nfs->rootfh.len;
@@ -1379,7 +1393,7 @@ nfs4_lookup_path_1_cb(struct rpc_context *rpc, int status, void *command_data,
         }
 
         /* We need to resolve the symlink */
-        if ((i = nfs4_allocate_op(nfs, &op, path, 1)) < 0) {
+        if ((i = nfs4_allocate_op(nfs, &op, path, 1, NULL)) < 0) {
                 data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
                 free_nfs4_cb_data(data);
                 free(path);
@@ -1407,7 +1421,61 @@ nfs4_lookup_path_1_cb(struct rpc_context *rpc, int status, void *command_data,
 }
 
 static int
-nfs4_lookup_path_async(struct nfs_context *nfs,
+nfs4_lookup_path_async_helper(struct nfs_context *nfs,
+                       struct nfs4_cb_data *data,
+                       rpc_cb cb);
+
+static void nfs4_lookup_path_async_helper_cb(struct rpc_context *rpc,
+                                             int status, void *command_data,
+                                             void *private_data) {
+  struct nfs4_cb_data *data = private_data;
+  struct nfs_context *nfs = data->nfs;
+  GETFH4resok *gfhresok;
+  COMPOUND4res *res = command_data;
+  assert(rpc->magic == RPC_CONTEXT_MAGIC);
+  int i = 0;
+
+  if (check_nfs4_error(nfs, status, data, res, "GETFH")) {
+    data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
+    free_nfs4_cb_data(data);
+    return;
+  }
+
+  if ((i = nfs4_find_op(nfs, data, res, OP_GETFH, "GETFH")) < 0) {
+    data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
+    free_nfs4_cb_data(data);
+    return;
+  }
+
+  gfhresok =
+      &res->resarray.resarray_val[i].nfs_resop4_u.opgetfh.GETFH4res_u.resok4;
+
+  if (data->lookup_last_fh.len != 0) {
+    free(data->lookup_last_fh.val);
+    data->lookup_last_fh.val = NULL;
+  }
+  data->lookup_last_fh.len = gfhresok->object.nfs_fh4_len;
+  data->lookup_last_fh.val = malloc(data->lookup_last_fh.len);
+  if (data->lookup_last_fh.val == NULL) {
+    nfs_set_error(nfs, "%s: %s", __FUNCTION__, nfs_get_error(nfs));
+    data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
+    free_nfs4_cb_data(data);
+    return;
+  }
+  memcpy(data->lookup_last_fh.val, gfhresok->object.nfs_fh4_val,
+         data->lookup_last_fh.len);
+  data->lookup_curr_component_idx++;
+  if (data->lookup_curr_component_idx == data->lookup_total_components) {
+    data->cb(0, nfs, NULL, data->private_data);
+    free_nfs4_cb_data(data);
+    return;
+  }
+  nfs4_lookup_path_async_helper(nfs, data, nfs4_lookup_path_async_helper_cb);
+
+}
+
+static int
+nfs4_lookup_path_async_helper(struct nfs_context *nfs,
                        struct nfs4_cb_data *data,
                        rpc_cb cb)
 {
@@ -1416,23 +1484,14 @@ nfs4_lookup_path_async(struct nfs_context *nfs,
         char *path;
         int i, num_op;
 
-        path = nfs4_resolve_path(nfs, data->path);
-        if (path == NULL) {
-                return -1;
-        }
-        free(data->path);
-        data->path = path;
-
-        path = strdup(path);
-        if (path == NULL) {
-                return -1;
-        }
-
-        fprintf(stderr, "path %s\n", path);
-        if ((i = nfs4_allocate_op(nfs, &op, path, data->filler.max_op)) < 0) {
+        path = data->lookup_path_components[data->lookup_curr_component_idx];
+        fprintf(stderr, "nfs4_allocate %s\n", path);
+        if ((i = nfs4_allocate_op(nfs, &op, path, data->filler.max_op, &data->lookup_last_fh)) < 0) {
                 free(path);
                 return -1;
         }
+        fprintf(stderr, "done nfs4_allocate %s\n", path);
+
 
 
         num_op = data->filler.func(data, &op[i]);
@@ -1447,14 +1506,55 @@ nfs4_lookup_path_async(struct nfs_context *nfs,
                                     data, nfs->sessionid, &nfs->seqid) != 0) {
                 nfs_set_error(nfs, "Failed to queue LOOKUP command. %s",
                               nfs_get_error(nfs));
-                free(path);
                 free(op);
                 return -1;
         }
 
-        free(path);
         free(op);
         return 0;
+}
+
+static int nfs4_lookup_path_async(struct nfs_context *nfs,
+                                  struct nfs4_cb_data *data, rpc_cb cb) {
+  char *path;
+  char *token;
+  int i;
+
+  fprintf(stderr, "lookup path %s\n", data->path);
+  path = nfs4_resolve_path(nfs, data->path);
+  if (path == NULL) {
+    return -1;
+  }
+  free(data->path);
+
+  path = strdup(path);
+  if (path == NULL) {
+    return -1;
+  }
+
+  data->lookup_total_components = nfs4_num_path_components(nfs, path);
+  data->lookup_path_components =
+      malloc(data->lookup_total_components * sizeof(char *));
+  data->lookup_curr_component_idx = 0;
+  data->lookup_last_fh.len = 0;
+  data->lookup_last_fh.val = NULL;
+
+  i = 0;
+  while ((token = strtok_r(path, "/", &path))) {
+    data->lookup_path_components[i] = malloc(strlen(token) + 2);
+    data->lookup_path_components[i][0] = '/';
+    strcpy(&data->lookup_path_components[i][1], token);
+    fprintf(stderr, "path components %s\n", data->lookup_path_components[i]);
+    i++;
+  }
+
+  if (i == 0) {
+    data->lookup_path_components[i] = malloc(2);
+    strcpy(&data->lookup_path_components[i][0], "/");
+  }
+
+  return nfs4_lookup_path_async_helper(nfs, data,
+                                       nfs4_lookup_path_async_helper_cb);
 }
 
 static int
@@ -1729,10 +1829,10 @@ nfs4_mount_async(struct nfs_context *nfs, const char *server,
 
         new_export = strdup(export);
         if (nfs_normalize_path(nfs, new_export)) {
-                nfs_set_error(nfs, "Bad export path. %s",
-                              nfs_get_error(nfs));
-                free(new_export);
-                return -1;
+          nfs_set_error(nfs, "Bad export path. %s :%s", new_export,
+                        nfs_get_error(nfs));
+          free(new_export);
+          return -1;
         }
         free(nfs->export);
         nfs->export = new_export;
@@ -2482,7 +2582,6 @@ nfs4_open_readlink(struct rpc_context *rpc, COMPOUND4res *res,
                 if (ores->status != NFS4ERR_SYMLINK) {
                         continue;
                 }
-
                 if (data->filler.flags & O_NOFOLLOW) {
                         nfs_set_error(nfs, "Symlink encountered during "
                                       "open(O_NOFOLLOW)");
@@ -3124,6 +3223,7 @@ int
 nfs4_create_async(struct nfs_context *nfs, const char *path, int flags,
                   int mode, nfs_cb cb, void *private_data)
 {
+
         return nfs4_open_async(nfs, path, O_CREAT | flags, mode,
                                cb, private_data);
 }
