@@ -486,7 +486,6 @@ int nfs3_utimes_async_internal(struct nfs_context *nfs, const char *path,
 int nfs3_write_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
                      uint64_t count, const void *buf, nfs_cb cb,
                      void *private_data);
-
 int nfs4_access_async(struct nfs_context *nfs, const char *path, int mode,
                       nfs_cb cb, void *private_data);
 int nfs4_access2_async(struct nfs_context *nfs, const char *path, nfs_cb cb,
